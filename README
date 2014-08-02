@@ -1,0 +1,18 @@
+
+Install and run on Ubuntu 14.04
+-------------------------------
+
+Install dependancies:
+
+  sudo aptitude install ruby2.0-dev ruby-gstreamer
+  sudo ruby2.0 /usr/bin/gem install sinatra sinatra-contrib data_mapper dm-sqlite-adapter sqlite3
+
+
+Run:
+
+  ruby2.0 main.rb
+
+
+Create a test RTP stream to a localhost port 5004:
+
+  curl --request PUT --data-binary '{"dst_host":"localhost","dst_port":5004}' http://localhost:4567/streams/test
