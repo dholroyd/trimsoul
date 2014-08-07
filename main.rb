@@ -75,7 +75,7 @@ class Stream
   end
 
   def start
-    @bin = Gst::Pipeline.new(id)
+    @pipeline = Gst::Pipeline.new("pipeline-#{id}")
     src = nil
     case $kind
     when :test
@@ -84,30 +84,20 @@ class Stream
       src.freq = 200
       src.samplesperbuffer = 240
     when :playlist
-      src = Gst::ElementFactory.make("uridecodebin")
+      src = Gst::ElementFactory.make("playbin")
       if src.nil?
-	raise "failed to create 'uridecodebin'"
+	raise "failed to create 'playbin'"
       end
-      src.signal_connect("drained") do |src|
-        puts "#{src} drained"
-	src.uri = "file:#{$playlist.next}"
-	@bin.play
-      end
-      src.signal_connect("pad-added") do |src, pad|
-	caps = pad.caps
-	name = caps.get_structure(0).name
-	if !@apad.linked? && name == "audio/x-raw"
-	  pad.link(@apad)
-	end
+      src.signal_connect("about-to-finish") do |src|
+	next_uri = $playlist.next
+	src.uri = "file:#{next_uri}"
+        puts "#{src} about-to-finish, next: #{next_uri}"
       end
       src.uri = "file:#{$playlist.next}"
     end
-    conv = Gst::ElementFactory.make("audioconvert")
-    conv2 = Gst::ElementFactory.make("audioconvert")
-    resample = Gst::ElementFactory.make("audioresample")
-    #capsfilter = Gst::ElementFactory.make("capsfilter")
-    # remember the sink so we can link to it from the 'pad-added' callback above,
-    @apad = conv.sinkpad
+    conv = Gst::ElementFactory.make("audioconvert", "pre-resample-conv")
+    conv2 = Gst::ElementFactory.make("audioconvert", "pre-rtp-conv")
+    resample = Gst::ElementFactory.make("audioresample", "to-48kHz-resample")
     rtp = Gst::ElementFactory.make("rtpL24pay")
     # default element MTU gives packets shorter than we want,
     rtp.mtu = 1452
@@ -116,7 +106,16 @@ class Stream
     udp.port = dst_port
     udp.host = dst_host
     # add all children to parent pipeline,
-    @bin << src << conv << resample << conv2 << rtp << udp
+    @pipeline << src
+
+    sink_bin = Gst::Bin.new("sink_bin")
+    sink_bin << conv << resample << conv2 << rtp << udp
+    gpad = Gst::GhostPad.new("sink", conv.sinkpad)
+    gpad.active = true
+    sink_bin.add_pad(gpad) or raise "add_pad failed"
+
+    src.audio_sink = sink_bin
+
     src >> conv
     conv >> resample
     caps = Gst::Caps.from_string("audio/x-raw,rate=48000")
@@ -125,9 +124,7 @@ class Stream
     end
     conv2 >> rtp
     rtp >> udp
-    ret = @bin.play
-    # TODO: event_loop is for debugging - presumably blocks sinatra :(
-    event_loop(@bin)
+    ret = @pipeline.play
     case ret
     when Gst::StateChangeReturn::FAILURE
       $stderr.puts "failed to play"
@@ -139,8 +136,8 @@ class Stream
   end
 
   def stop
-    @bin.stop
-    @bin.remove_all
+    @pipeline.stop
+    @pipeline.remove_all
   end
 
   def self.[](id)
