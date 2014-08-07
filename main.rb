@@ -9,7 +9,7 @@ DataMapper::Model.raise_on_save_failure = true
 
 class Playlist
   def initialize
-    @list = Pathname.glob("audio/ebu_sqam/*.flac").map{|p| p.realpath}
+    @list = Pathname.glob("audio/ebu_sqam/*.flac").sort.map{|p| p.realpath}
     @index = -1
   end
 
