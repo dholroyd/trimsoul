@@ -16,3 +16,13 @@ Run:
 Create a test RTP stream to a localhost port 5004:
 
   curl --request PUT --data-binary '{"dst_host":"localhost","dst_port":5004}' http://localhost:4567/streams/test
+
+
+Listen to the resulting stream:
+
+Includes a waveform view and timestamps since playback started (not AES67-style though),
+
+  gst-launch-1.0 udpsrc port=5004 caps='application/x-rtp,media=audio,clock-rate=48000,encoding-name=L24,encoding-params=2,channels=2,payload=96' \
+	! rtpjitterbuffer ! rtpL24depay ! audio/x-raw,rate=48000 \
+	! tee name=t ! queue ! autoaudiosink t. ! audioconvert \
+	! wavescope ! videoconvert ! timeoverlay ! ximagesink
