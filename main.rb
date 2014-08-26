@@ -24,11 +24,72 @@ class Playlist
   end
 end
 
+def handle_tags(tag_list)
+  0.upto(tag_list.n_tags-1) do |i|
+    name = tag_list.nth_tag_name(i)
+    if name == "title"
+      s, title = tag_list.string?(name)
+      if s && title != @title
+	puts "  TITLE: #{title}"
+	@title = title
+      end
+    end
+  end
+end
+
+def add_bus_watcher(name, pipeline)
+  callback = Proc.new do |bus, msg, data|
+    begin
+      case msg.type
+      when :eos
+	puts "#{name} End of stream"
+      when :warning
+	puts "#{name} Warning:"
+	warning, debug = msg.parse_warning
+	puts "#{name} Debugging info: #{debug || 'none'}"
+	puts warning.message
+      when :error
+	puts "#{name} Error:"
+	error, debug = msge.parse_error
+	puts "#{name} Debugging info: #{debug || 'none'}"
+	puts error.message
+      when :tag
+	handle_tags(msg.parse_tag)
+      when :state_changed
+	oldstate, newstate, pending = msg.parse_state_changed
+	val = GObject::Value.new
+	val.init(GObject::TYPE_STRING)
+	msg.src.get_property_without_override("name", val)
+	print "#{name} State changed #{val.get_value}: #{oldstate}->#{newstate}"
+	puts pending==:void_pending ? "" : " (pending: #{pending})"
+	if msg.src == pipeline
+	  if newstate==:ready
+	    puts "#{name}  ..setting pipeline to :paused"
+	    pipeline.set_state(:paused)
+	  elsif oldstate==:ready && newstate==:paused
+	    puts "#{name}  ..setting pipeline to :playing"
+	    pipeline.set_state(:playing)
+	  end
+	end
+      else
+	puts "#{name} #{msg.type}"
+      end
+      $stdout.flush
+    rescue => e
+      p e
+    end
+    true
+  end
+  pipeline.get_bus.add_watch(GLib::PRIORITY_DEFAULT, callback, nil, nil)
+end
+
 class Sender
   def initialize(id, dst_port, dst_host)
+    intersrc = Gst::ElementFactory.make("interaudiosrc", nil)
+    #intersrc.set_property_without_override("channel", "trimsoul")
+    intersrc.set_property_without_override("blocksize", 3200)
     conv = Gst::ElementFactory.make("audioconvert", "pre-resample-conv")
     conv2 = Gst::ElementFactory.make("audioconvert", "pre-rtp-conv")
-    audiorate = Gst::ElementFactory.make("audiorate", nil)
     resample = Gst::ElementFactory.make("audioresample", "to-48kHz-resample")
     rtp = Gst::ElementFactory.make("rtpL24pay", nil)
     # default element MTU gives packets shorter than we want,
@@ -48,29 +109,32 @@ class Sender
     udp.set_property_without_override("port", dst_port)
     udp.set_property_without_override("host", dst_host)
 
-    @sink_bin = Gst::Bin.new("sink_bin-#{id}")
-    @sink_bin.add conv
-    @sink_bin.add resample
-    @sink_bin.add conv2
-    @sink_bin.add audiorate
-    @sink_bin.add rtp
-    @sink_bin.add udp
-    gpad = Gst::GhostPad.new("sink", conv.get_static_pad("sink"))
-    gpad.active = true
-    @sink_bin.add_pad(gpad) or raise "add_pad failed"
+    @sender_pipeline = Gst::Pipeline.new("sender-pipeline-#{id}")
+    add_bus_watcher("Sender", @sender_pipeline)
+    @sender_pipeline.set_auto_flush_bus(false)
+    @sender_pipeline.add intersrc
+    @sender_pipeline.add conv
+    @sender_pipeline.add resample
+    @sender_pipeline.add conv2
+    @sender_pipeline.add rtp
+    @sender_pipeline.add udp
+    #gpad = Gst::GhostPad.new("sink", conv.get_static_pad("sink"))
+    #gpad.active = true
+    #@sender_pipeline.add_pad(gpad) or raise "add_pad failed"
+    intersrc.link(conv)
 
     conv.link(resample)
     caps = Gst::Caps.from_string("audio/x-raw,rate=48000,channels=2")
     unless resample.link_filtered(conv2, caps)
       raise "failed to link elements using filter #{caps}"
     end
-    #conv2.link(audiorate)
-    #audiorate.link(rtp)
     conv2.link(rtp)
     rtp.link(udp)
   end
-
-  attr_reader :sink_bin
+  attr_reader :sender_pipeline
+  def start
+    @sender_pipeline.set_state(:ready)
+  end
 end
 
 class TestSource
@@ -93,51 +157,71 @@ end
 
 class FestivalSource
   def initialize()
+    @pipeline = Gst::Pipeline.new("festival-src-pipeline")
+    @pipeline.set_auto_flush_bus(false)
+    add_bus_watcher("Festival", @pipeline)
+    @intersink = Gst::ElementFactory.make("interaudiosink", nil) or raise "failed to make interaudiosink element"
+    #@intersink.set_property_without_override("channel", "trimsoul")
+    @intersink.set_property_without_override("sync", true)
     @appsrc = Gst::ElementFactory.make("appsrc", nil) or raise "failed to make appsrc element"
     @appsrc.caps = Gst::Caps.from_string("text/x-raw,format=\"utf8\"")
     @festival = Gst::ElementFactory.make("festival", nil) or raise "failed to make festival element"
     @wavparse = Gst::ElementFactory.make("wavparse", nil) or raise "failed to make wavparse element"
-    @identity = Gst::ElementFactory.make("identity", nil) or raise "failed to make identity element"
-    @identity.set_property_without_override("signal-handoffs", true)
+    @conv = Gst::ElementFactory.make("audioconvert", nil) or raise "failed to make audioconvert element"
+    @resample = Gst::ElementFactory.make("audioresample", nil)
+    #@identity = Gst::ElementFactory.make("identity", nil) or raise "failed to make identity element"
+    #@identity.set_property_without_override("signal-handoffs", true)
     @offset = 0
     @last_time = nil
-    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |identity, buf, data|
-      b = Gst::Buffer.wrap(buf)
-      b.pts = b.pts + @offset
-      #puts "buffer pts=#{b.pts.inspect} dts=#{b.dts.inspect}"
-    end
-    GirFFI::CallbackBase.store_callback callback
-    r = GObject::Lib.g_signal_connect_data(@identity, "handoff", callback, nil, nil, 0)
-    puts "g_signal_connect_data(#{@identity}, #{"handoff"}, #{callback}) => #{r}"
+#    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |identity, buf, data|
+#      begin
+#	b = Gst::Buffer.wrap(buf)
+#	#b.pts = b.pts + @offset
+#	puts "buffer pts=#{b.pts.inspect} dts=#{b.dts.inspect} duration=#{b.duration.inspect}"
+#      rescue => e
+#	$stderr.puts [e, *e.backtrace].join("\n  ")
+#      end
+#    end
+#    GirFFI::CallbackBase.store_callback callback
+#    r = GObject::Lib.g_signal_connect_data(@identity, "handoff", callback, nil, nil, 0)
+#    puts "g_signal_connect_data(#{@identity}, #{"handoff"}, #{callback}) => #{r}"
   end
 
-  def link(pipeline, sender)
-    @pipeline = pipeline
-    pipeline.add @appsrc
-    pipeline.add @festival
-    pipeline.add @wavparse
-    pipeline.add @identity
-    pipeline.add sender.sink_bin
-    @appsrc.link(@festival)
-    @festival.link(@wavparse)
-    @wavparse.link(@identity)
-    @identity.link(sender.sink_bin)
-    Thread.new do
-      sleep 1
-      # TODO: track actual pipeline state (signals?)
-      state = :playing
-      while state == :playing
-	begin
-	  # make waveparse recognise a new file
-	  @wavparse.set_state(:ready)
-	  @wavparse.set_state(:playing)
-	  announce_time(Time.new)
-	  sleep 10
-	rescue => e
-	  $stderr.puts [e, *e.backtrace].join("\n  ")
-	end
+  def link(sender)
+    @pipeline.add @appsrc
+    @pipeline.add @festival
+    @pipeline.add @wavparse
+    @pipeline.add @intersink
+#    @pipeline.add @identity
+    @pipeline.add @conv
+    @pipeline.add @resample
+    #@pipeline.add sender.sink_bin
+    @appsrc.link(@festival) or raise "not linked"
+    @festival.link(@wavparse) or raise "not linked"
+    @wavparse.link(@conv) or raise "not linked"
+    #@wavparse.link(@identity) or raise "not linked"
+    #@identity.link(@conv) or raise "not linked"
+    @conv.link(@resample) or raise "not linked"
+    @resample.link(@intersink) or raise "not linked"
+    callback = Proc.new do
+      begin
+	# make waveparse recognise a new file
+	@pipeline.set_state(:ready)
+	@pipeline.set_state(:playing)
+	announce_time(Time.new)
+      rescue => e
+	$stderr.puts [e, *e.backtrace].join("\n  ")
       end
+      true
     end
+    # TODO: probably the 'notify' argument is required for proper GC?
+    GLib.timeout_add(GLib::PRIORITY_DEFAULT, 10_000, callback, nil, nil)
+  end
+
+  attr_reader :pipeline
+
+  def start
+    @pipeline.set_state(:ready)
   end
 
   private
@@ -199,73 +283,33 @@ class Player
   end
 
   def start
-    @pipeline = Gst::Pipeline.new("pipeline-#{@id}")
 
-    # add all children to parent pipeline,
-    #@pipeline << @source.element
-    @source.link(@pipeline, @sender)
+    @source.link(@sender)
 
-    ret = @pipeline.set_state(:playing)
-    if ret == :failure
-      raise "failed to play"
+    @sender.start
+    @source.start
+    @main_loop = GLib::MainLoop.new(nil, true)
+    trap("SIGINT") do
+      $stderr.puts "trimsoul: quit"
+      @main_loop.quit
     end
-    event_loop(@pipeline)
-  end
-
-
-  def stop
-    @pipeline.stop
-    @pipeline.remove_all
+    @main_loop.run
   end
 
   private
 
-  def event_loop(pipe)
+  def event_loop(name, pipe)
     running = true
     bus = pipe.bus
 
     @title = nil
     while running
       message = bus.poll(:any, -1)
-      raise "message nil" if message.nil?
+      raise "#{name} message nil" if message.nil?
 
-      case message.type
-      when :eos
-	puts "End of stream"
-	running = false
-      when :warning
-	puts "Warning:"
-	warning, debug = message.parse_warning
-	puts "Debugging info: #{debug || 'none'}"
-	puts warning.message
-      when :error
-	puts "Error:"
-	error, debug = message.parse_error
-	puts "Debugging info: #{debug || 'none'}"
-	puts error.message
-	running = false
-      when :tag
-	handle_tags(message.parse_tag)
-      when :state_changed
-	puts "State changed: #{message.parse_state_changed.inspect}"
-      else
-	p message.type
-      end
     end
   end
 
-  def handle_tags(tag_list)
-    0.upto(tag_list.n_tags-1) do |i|
-      name = tag_list.nth_tag_name(i)
-      if name == "title"
-	s, title = tag_list.string?(name)
-	if s && title != @title
-	  puts "  TITLE: #{title}"
-	  @title = title
-	end
-      end
-    end
-  end
 end
 
 class PlayService
