@@ -85,9 +85,6 @@ end
 
 class Sender
   def initialize(id, dst_port, dst_host)
-    intersrc = Gst::ElementFactory.make("interaudiosrc", nil)
-    #intersrc.set_property_without_override("channel", "trimsoul")
-    intersrc.set_property_without_override("blocksize", 3200)
     conv = Gst::ElementFactory.make("audioconvert", "pre-resample-conv")
     conv2 = Gst::ElementFactory.make("audioconvert", "pre-rtp-conv")
     resample = Gst::ElementFactory.make("audioresample", "to-48kHz-resample")
@@ -109,19 +106,15 @@ class Sender
     udp.set_property_without_override("port", dst_port)
     udp.set_property_without_override("host", dst_host)
 
-    @sender_pipeline = Gst::Pipeline.new("sender-pipeline-#{id}")
-    add_bus_watcher("Sender", @sender_pipeline)
-    @sender_pipeline.set_auto_flush_bus(false)
-    @sender_pipeline.add intersrc
-    @sender_pipeline.add conv
-    @sender_pipeline.add resample
-    @sender_pipeline.add conv2
-    @sender_pipeline.add rtp
-    @sender_pipeline.add udp
-    #gpad = Gst::GhostPad.new("sink", conv.get_static_pad("sink"))
-    #gpad.active = true
-    #@sender_pipeline.add_pad(gpad) or raise "add_pad failed"
-    intersrc.link(conv)
+    @sink_bin = Gst::Bin.new("sink_bin-#{id}")
+    @sink_bin.add conv
+    @sink_bin.add resample
+    @sink_bin.add conv2
+    @sink_bin.add rtp
+    @sink_bin.add udp
+    gpad = Gst::GhostPad.new("sink", conv.get_static_pad("sink"))
+    gpad.active = true
+    @sink_bin.add_pad(gpad) or raise "add_pad failed"
 
     conv.link(resample)
     caps = Gst::Caps.from_string("audio/x-raw,rate=48000,channels=2")
@@ -131,10 +124,8 @@ class Sender
     conv2.link(rtp)
     rtp.link(udp)
   end
-  attr_reader :sender_pipeline
-  def start
-    @sender_pipeline.set_state(:ready)
-  end
+  attr_reader :sink_bin
+
 end
 
 class TestSource
@@ -157,20 +148,16 @@ end
 
 class FestivalSource
   def initialize()
-    @pipeline = Gst::Pipeline.new("festival-src-pipeline")
-    @pipeline.set_auto_flush_bus(false)
-    add_bus_watcher("Festival", @pipeline)
-    @intersink = Gst::ElementFactory.make("interaudiosink", nil) or raise "failed to make interaudiosink element"
-    #@intersink.set_property_without_override("channel", "trimsoul")
-    @intersink.set_property_without_override("sync", true)
     @appsrc = Gst::ElementFactory.make("appsrc", nil) or raise "failed to make appsrc element"
     @appsrc.caps = Gst::Caps.from_string("text/x-raw,format=\"utf8\"")
     @festival = Gst::ElementFactory.make("festival", nil) or raise "failed to make festival element"
     @wavparse = Gst::ElementFactory.make("wavparse", nil) or raise "failed to make wavparse element"
-    @conv = Gst::ElementFactory.make("audioconvert", nil) or raise "failed to make audioconvert element"
-    @resample = Gst::ElementFactory.make("audioresample", nil)
-    #@identity = Gst::ElementFactory.make("identity", nil) or raise "failed to make identity element"
+    @identity = Gst::ElementFactory.make("identity", nil) or raise "failed to make identity element"
     #@identity.set_property_without_override("signal-handoffs", true)
+    @identity.set_property_without_override("single-segment", true)
+    @identity.set_property_without_override("sync", true)
+    @audiorate = Gst::ElementFactory.make("audiorate", nil) or raise "failed to make audiorate element"
+    @audiorate.set_property_without_override("tolerance", true)
     @offset = 0
     @last_time = nil
 #    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |identity, buf, data|
@@ -187,27 +174,24 @@ class FestivalSource
 #    puts "g_signal_connect_data(#{@identity}, #{"handoff"}, #{callback}) => #{r}"
   end
 
-  def link(sender)
-    @pipeline.add @appsrc
-    @pipeline.add @festival
-    @pipeline.add @wavparse
-    @pipeline.add @intersink
-#    @pipeline.add @identity
-    @pipeline.add @conv
-    @pipeline.add @resample
-    #@pipeline.add sender.sink_bin
+  def link(pipeline, sender)
+    @pipeline = pipeline
+    pipeline.add @appsrc
+    pipeline.add @festival
+    pipeline.add @wavparse
+    pipeline.add @identity
+    pipeline.add @audiorate
+    pipeline.add sender.sink_bin
     @appsrc.link(@festival) or raise "not linked"
     @festival.link(@wavparse) or raise "not linked"
-    @wavparse.link(@conv) or raise "not linked"
-    #@wavparse.link(@identity) or raise "not linked"
-    #@identity.link(@conv) or raise "not linked"
-    @conv.link(@resample) or raise "not linked"
-    @resample.link(@intersink) or raise "not linked"
+    @wavparse.link(@identity) or raise "not linked"
+    @identity.link(@audiorate) or raise "not linked"
+    @audiorate.link(sender.sink_bin) or raise "not linked"
     callback = Proc.new do
       begin
 	# make waveparse recognise a new file
-	@pipeline.set_state(:ready)
-	@pipeline.set_state(:playing)
+	@wavparse.set_state(:ready)
+	@wavparse.set_state(:playing)
 	announce_time(Time.new)
       rescue => e
 	$stderr.puts [e, *e.backtrace].join("\n  ")
@@ -218,17 +202,12 @@ class FestivalSource
     GLib.timeout_add(GLib::PRIORITY_DEFAULT, 10_000, callback, nil, nil)
   end
 
-  attr_reader :pipeline
-
-  def start
-    @pipeline.set_state(:ready)
-  end
-
   private
 
   def announce_time(t)
     if @last_time
       @offset += (t - @last_time) * 1_000_000_000
+      @wavparse.get_static_pad("src").set_offset(@offset)
     end
     add = GObject::Value.new
     add.init(GObject::TYPE_UINT64)
@@ -278,16 +257,17 @@ class Player
 
   def initialize(id, source, sender)
     @id = id
+    @pipeline = Gst::Pipeline.new("sender-pipeline-#{id}")
+    @pipeline.set_auto_flush_bus(false)
     @source = source
     @sender = sender
   end
 
   def start
 
-    @source.link(@sender)
+    @source.link(@pipeline, @sender)
 
-    @sender.start
-    @source.start
+    @pipeline.set_state(:playing)
     @main_loop = GLib::MainLoop.new(nil, true)
     trap("SIGINT") do
       $stderr.puts "trimsoul: quit"
