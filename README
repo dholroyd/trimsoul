@@ -1,3 +1,7 @@
+Note that this code was unfinished at the time I stopped working on it, and required
+patches to Gstreamer to get resonable results,
+http://gstreamer-devel.966125.n4.nabble.com/Talking-clock-timestamp-problem-td4668337.html
+(The code in that area of Gstreamer has since changed though.)
 
 Install and run on Ubuntu 14.04
 -------------------------------
